@@ -10787,6 +10787,585 @@ function loadExampleMemoire() {
 })();
 
 </script>
+  <script>
+   /* === PATCH === */
+  // ============================================================
+// THESIS ARCHITECT — PATCH v1.1
+// Fixes all print-preview bugs:
+//   1. Chapter numbering (front matter counted as Ch.1)
+//   2. Front/refs/appendices rendered twice in body loop
+//   3. TOC structure & page number placement
+//   4. Appendices never rendered separately
+//   5. Abstract using wrong fr_remerciements fallback
+//   6. romanFront too short (only 6 entries)
+//   7. Abbreviations page never rendered
+//   8. Dédicace page never rendered (French)
+// Insert this <script> block just before </body> in the HTML
+// ============================================================
+
+(function() {
+'use strict';
+
+// ── Set of chapter IDs that are NOT numbered body chapters ──
+// They have dedicated rendering blocks (title, TOC, refs, etc.)
+const SKIP_BODY_CH = new Set([
+  'front',          // handled as title/abstract/TOC/figures/tables/ack pages
+  'references',     // has its own dedicated rendering block
+  'appendices',     // rendered separately after references
+  'annexes',        // alias
+  'resume',         // French 4ème de couverture
+  'resume_section', // alias
+]);
+
+// ── Override renderPrintPages ────────────────────────────────
+window.renderPrintPages = function renderPrintPages() {
+
+  let _pg = 0;
+
+  function pgWrap(content, pgLabel, extraClass) {
+    _pg++;
+    const rawLabel = (pgLabel !== undefined && pgLabel !== '') ? pgLabel : _pg;
+    const showLabel = (arabicMode && typeof rawLabel === 'number')
+      ? toEasternArabic(rawLabel)
+      : rawLabel;
+    const rtlStyle = arabicMode
+      ? ' style="direction:rtl;font-family:\'Amiri\',serif;text-align:right;"'
+      : '';
+    const pgNumPos = arabicMode ? 'pg-num-real pg-num-left' : 'pg-num-real pg-num-center';
+    return `<div class="a4-page ${extraClass||''}" data-page="${_pg}"${rtlStyle}>
+      ${content}
+      <div class="${pgNumPos}" style="position:absolute;bottom:14mm;${arabicMode?'left:22mm':'left:50%;transform:translateX(-50%)'};font-family:'Times New Roman',serif;font-size:10pt;color:#555">${showLabel !== '' ? showLabel : ''}</div>
+    </div>`;
+  }
+
+  function buildSectionText(sec, d, get) {
+    let secText = '';
+    if (!sec || !sec.fields) return secText;
+    sec.fields.forEach(f => {
+      const val = get(f.id);
+      if (!val) return;
+      if (f.type === 'tags') {
+        try {
+          const tags = JSON.parse(d[f.id] || '[]');
+          if (tags.length)
+            secText += `<div style="margin-bottom:2mm"><strong>${escHtml(f.label)}:</strong> ${tags.map(escHtml).join(' · ')}</div>`;
+        } catch(e) {}
+      } else if (f.type === 'select') {
+        secText += `<div style="margin-bottom:2mm"><strong>${escHtml(f.label)}:</strong> ${escHtml(val)}</div>`;
+      } else {
+        const rendered = wrapText(val);
+        const multiField = sec.fields.filter(f2 => f2.type === 'textarea' || f2.type === 'text').length > 1;
+        const labelHtml = multiField
+          ? `<div style="font-size:10pt;font-weight:bold;color:#555;margin:4mm 0 1mm;text-transform:uppercase;letter-spacing:0.06em">${escHtml(f.label)}</div>`
+          : '';
+        secText += labelHtml + `<div style="margin-bottom:4mm;text-align:justify">${rendered}</div>`;
+      }
+    });
+    return secText;
+  }
+
+  // ── Localised labels ─────────────────────────────────────
+  const pLbl = {
+    abstract:        arabicMode ? 'الملخص'            : (frenchMode ? 'Résumé'                : 'Abstract'),
+    context:         arabicMode ? 'السياق'             : (frenchMode ? 'Contexte'              : 'Context'),
+    objective:       arabicMode ? 'الهدف'              : (frenchMode ? 'Objectif'              : 'Objective'),
+    methodology:     arabicMode ? 'المنهجية'           : (frenchMode ? 'Méthodologie'          : 'Methodology'),
+    results:         arabicMode ? 'النتائج'            : (frenchMode ? 'Résultats'             : 'Key Results'),
+    conclusion:      arabicMode ? 'الخلاصة'            : (frenchMode ? 'Conclusion'            : 'Conclusion'),
+    keywords:        arabicMode ? 'الكلمات المفتاحية'  : (frenchMode ? 'Mots-clés'             : 'Keywords'),
+    toc:             arabicMode ? 'فهرس المحتويات'     : (frenchMode ? 'Table des matières'    : 'Table of Contents'),
+    figures:         arabicMode ? 'قائمة الأشكال'      : (frenchMode ? 'Liste des figures'     : 'List of Figures'),
+    tables:          arabicMode ? 'قائمة الجداول'      : (frenchMode ? 'Liste des tableaux'    : 'List of Tables'),
+    abbreviations:   arabicMode ? 'قائمة المختصرات'    : (frenchMode ? 'Liste des abréviations': 'List of Abbreviations'),
+    acknowledgements:arabicMode ? 'شكر وتقدير'         : (frenchMode ? 'Remerciements'         : 'Acknowledgements'),
+    dedicace:        arabicMode ? 'إهداء'              : (frenchMode ? 'Dédicace'              : 'Dedication'),
+    references:      arabicMode ? 'المراجع والمصادر'   : (frenchMode ? 'Bibliographie'         : 'References'),
+    appendices:      arabicMode ? 'الملاحق'            : (frenchMode ? 'Annexes'               : 'Appendices'),
+    chapterWord:     arabicMode ? 'الفصل'              : (frenchMode ? 'Chapitre'              : 'Chapter'),
+    notWritten:      arabicMode ? '(لم يُكتب بعد)'     : (frenchMode ? '(non rédigé)'          : '(not yet written)'),
+  };
+
+  // Roman numerals — extended to 12 for deep front-matter stacks
+  const romanFront = ['i','ii','iii','iv','v','vi','vii','viii','ix','x','xi','xii'];
+
+  const wrap = document.getElementById('printPagesWrap');
+  if (!wrap) return;
+  const pages = [];
+  const d   = data;
+  const get = k => ((d[k] !== undefined && d[k] !== null) ? String(d[k]) : '').trim();
+
+  // ── Page-map: front matter = roman, body = arabic ─────────
+  const pageMap = {};
+  let fmIdx = 0;
+  pageMap.title   = romanFront[fmIdx++]; // i
+
+  // Optional dédicace (French/Arabic)
+  const hasDedicace = !!(get('fr_dedicace') || get('dedication_text'));
+  pageMap.dedicace = romanFront[fmIdx];
+  if (hasDedicace) fmIdx++;
+
+  pageMap.abstract       = romanFront[fmIdx++];
+  pageMap.toc            = romanFront[fmIdx++];
+  pageMap.abbreviations  = romanFront[fmIdx++];
+  pageMap.figures        = romanFront[fmIdx++];
+  pageMap.tables         = romanFront[fmIdx++];
+  pageMap.ack            = romanFront[fmIdx++];
+
+  // Body pages — arabic 1, 2, 3 … (front matter and back matter excluded)
+  let bodyP = 1;
+  THESIS_STRUCTURE.forEach(ch => {
+    if (SKIP_BODY_CH.has(ch.id)) return;
+    pageMap['ch_' + ch.id] = bodyP;
+    bodyP += Math.max(ch.sections.length, 1);
+  });
+  pageMap.refs = bodyP;
+  pageMap.app  = bodyP + 1;
+
+  // ── Helper: tocRow ────────────────────────────────────────
+  function tocRow(label, pg, isChapter, indent) {
+    const pgStr = String(pg);
+    if (arabicMode) {
+      const indentStyle = indent ? 'padding-right:8mm;' : '';
+      const weight = isChapter ? 'font-weight:bold;margin-top:3mm;' : '';
+      return `<div style="display:flex;direction:rtl;align-items:baseline;font-size:11pt;margin-bottom:2mm;${weight}${indentStyle}">
+        <span style="flex:1;text-align:right">${label}</span>
+        <span style="flex:1;border-bottom:1px dotted #aaa;margin:0 4mm;min-width:20mm"></span>
+        <span style="white-space:nowrap;text-align:left;direction:ltr">${pgStr}</span>
+      </div>`;
+    } else {
+      const indentStyle = indent ? 'padding-left:8mm;' : '';
+      const weight = isChapter ? 'font-weight:bold;margin-top:3mm;' : '';
+      return `<div style="display:flex;direction:ltr;align-items:baseline;font-size:11pt;margin-bottom:2mm;${weight}${indentStyle}">
+        <span style="flex:1">${label}</span>
+        <span style="flex:1;border-bottom:1px dotted #aaa;margin:0 4mm;min-width:20mm"></span>
+        <span style="white-space:nowrap">${pgStr}</span>
+      </div>`;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 1. TITLE / COVER PAGE
+  // ═══════════════════════════════════════════════════════════
+  if (arabicMode) {
+    const inst      = get('institution') || 'المعهد الوطني المتخصص في التكوين المهني';
+    const branch    = get('dz_branch')   || '';
+    const subject   = get('thesis_title')|| 'موضوع المذكرة';
+    const caseStudy = get('dz_case_study') || '';
+    const unit      = get('dz_unit')     || '';
+    const spec      = get('degree')      || 'تسيير الموارد البشرية';
+    const trainee   = get('author_name') || 'اسم المتربص';
+    const prof      = get('supervisor')  || '';
+    const tutor     = get('dz_tutor')    || '';
+    const batch     = get('academic_year')|| '2023 – 2026';
+
+    pages.push(pgWrap(`
+    <div class="insfp-cover">
+      <div class="insfp-header-logos">
+        <div class="insfp-logo-box">🏛️</div>
+        <div class="insfp-header-text">
+          <div class="insfp-republic">الجمهورية الجزائرية الديمقراطية الشعبية</div>
+          <div class="insfp-ministry">وزارة التكوين والتعليم المهنيين</div>
+          <div class="insfp-institute">${escHtml(inst)}</div>
+          ${branch ? `<div class="insfp-institute">${escHtml(branch)}</div>` : ''}
+        </div>
+        <div class="insfp-logo-box">🎓</div>
+      </div>
+      <hr class="insfp-sep-double">
+      <div class="insfp-subject-label">:الموضوع</div>
+      <div class="insfp-title-box">${wrapText(subject)}</div>
+      ${caseStudy ? `<div class="insfp-case-study">${escHtml(caseStudy)}</div>` : ''}
+      ${unit      ? `<div class="insfp-unit">– ${escHtml(unit)} –</div>` : ''}
+      <hr class="insfp-sep">
+      <div class="insfp-memo-type">مذكرة نهاية التربص لنيل شهادة تقني سام في ${escHtml(spec)}</div>
+      <hr class="insfp-sep">
+      <div class="insfp-info-grid">
+        <div class="insfp-info-box"><div class="insfp-info-box-label">تحت إشراف</div><div class="insfp-info-box-value">${prof ? escHtml(prof) : '——'}</div></div>
+        <div class="insfp-info-box"><div class="insfp-info-box-label">من إعداد المتربص</div><div class="insfp-info-box-value">${escHtml(trainee)}</div></div>
+      </div>
+      ${tutor ? `<div class="insfp-tutor-row"><div class="insfp-info-box center"><div class="insfp-info-box-label">تحت تأطير السيد</div><div class="insfp-info-box-value">${escHtml(tutor)}</div></div></div>` : ''}
+      <div class="insfp-batch"><div class="insfp-batch-banner">الدفعة ${escHtml(batch)}</div></div>
+    </div>`, '', 'tp-page-wrap'));
+
+  } else {
+    // French / English cover
+    const frUniv    = get('institution')       || 'Université …';
+    const frFaculty = get('fr_faculty')        || '';
+    const frDept    = get('fr_department')     || '';
+    const frType    = get('fr_memoir_type')    || 'Mémoire en vue de l\'obtention du diplôme de Master';
+    const frSpec    = get('degree')            || '';
+    const frTheme   = get('thesis_title')      || 'Thème du mémoire';
+    const frAuthor  = get('author_name')       || '';
+    const frSuper   = get('supervisor')        || '';
+    const frJuryP   = get('fr_jury_president') || '';
+    const frJuryE   = get('fr_jury_examiner')  || '';
+    const frYear    = get('academic_year')     || new Date().getFullYear();
+
+    pages.push(pgWrap(`
+    <div style="width:100%;height:100%;display:flex;flex-direction:column;border:2px solid #1a3a6b;padding:8mm;box-sizing:border-box;font-family:'Times New Roman',serif;text-align:center;position:relative">
+      <div style="position:absolute;inset:6px;border:1px solid #5a7ab5;pointer-events:none"></div>
+      <div style="font-size:9pt;font-weight:bold;color:#1a1a1a;line-height:1.5;margin-bottom:1mm">الجمهورية الجزائرية الديمقراطية الشعبية</div>
+      <div style="font-size:9pt;font-weight:bold;color:#1a1a1a;margin-bottom:2mm">République Algérienne Démocratique et Populaire</div>
+      <div style="font-size:9pt;color:#222;margin-bottom:1mm">وزارة التعليم العالي والبحث العلمي</div>
+      <div style="font-size:9pt;color:#222;margin-bottom:2mm">Ministère de l'Enseignement Supérieur et de la Recherche Scientifique</div>
+      <hr style="border:none;border-top:1.5px solid #1a3a6b;margin:2mm 0">
+      <div style="font-size:11pt;font-weight:bold;color:#1a3a6b;margin-bottom:1mm">${escHtml(frUniv)}</div>
+      ${frFaculty ? `<div style="font-size:9.5pt;color:#333;margin-bottom:1mm">${escHtml(frFaculty)}</div>` : ''}
+      ${frDept    ? `<div style="font-size:9pt;color:#555;margin-bottom:1mm">${escHtml(frDept)}</div>`    : ''}
+      <hr style="border:none;border-top:1px solid #5a7ab5;margin:2mm 0">
+      <div style="font-size:10pt;font-style:italic;color:#333;margin-bottom:1mm">${escHtml(frType)}</div>
+      ${frSpec ? `<div style="font-size:10pt;color:#333;margin-bottom:3mm"><strong>Spécialité :</strong> ${escHtml(frSpec)}</div>` : ''}
+      <hr style="border:none;border-top:1px solid #5a7ab5;margin:2mm 0">
+      <div style="font-size:10pt;text-decoration:underline;font-weight:bold;margin-bottom:2mm;text-align:right">:Thème</div>
+      <div style="border:1.5px solid #5a7ab5;background:#e8edf8;padding:4mm 6mm;font-size:16pt;font-weight:bold;color:#1a1a1a;line-height:1.4;margin:2mm 0">${wrapText(frTheme)}</div>
+      <div style="display:flex;justify-content:space-between;margin:4mm 0;gap:4mm">
+        <div style="border:1px solid #5a7ab5;padding:3mm;flex:1;text-align:center">
+          <div style="font-size:9pt;color:#555;margin-bottom:1mm;border-bottom:1px solid #ddd;padding-bottom:1mm">Présenté par :</div>
+          <div style="font-weight:bold;font-size:10pt">${escHtml(frAuthor)}</div>
+        </div>
+        ${frSuper ? `<div style="border:1px solid #5a7ab5;padding:3mm;flex:1;text-align:center">
+          <div style="font-size:9pt;color:#555;margin-bottom:1mm;border-bottom:1px solid #ddd;padding-bottom:1mm">Encadré par :</div>
+          <div style="font-weight:bold;font-size:10pt">${escHtml(frSuper)}</div>
+        </div>` : ''}
+      </div>
+      ${(frJuryP || frJuryE) ? `<div style="border:1px solid #5a7ab5;padding:3mm;margin:2mm 0;text-align:left;font-size:9.5pt">
+        <div style="font-weight:bold;color:#1a3a6b;margin-bottom:2mm;text-align:center">Devant le jury composé de :</div>
+        ${frJuryP ? `<div><strong>Présidente :</strong> ${escHtml(frJuryP)}</div>` : ''}
+        ${frJuryE ? `<div><strong>Examinateur :</strong> ${escHtml(frJuryE)}</div>` : ''}
+        ${frSuper ? `<div><strong>Rapporteur :</strong> ${escHtml(frSuper)}</div>` : ''}
+      </div>` : ''}
+      <div style="margin-top:auto;padding-top:3mm">
+        <div style="background:linear-gradient(135deg,#c8d4f0,#e8edf8);border:1px solid #5a7ab5;padding:2mm 12mm;display:inline-block;font-size:11pt;font-weight:bold;color:#1a3a6b">Année universitaire ${escHtml(String(frYear))}</div>
+      </div>
+    </div>`, '', 'tp-page-wrap'));
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 2. DÉDICACE  (French / Arabic only, if filled)
+  // ═══════════════════════════════════════════════════════════
+  const dedicaceText = get('fr_dedicace') || get('dedication_text');
+  if (dedicaceText) {
+    const dDir = arabicMode ? `direction:rtl;text-align:right;font-family:'Amiri',serif;` : '';
+    pages.push(pgWrap(`<div style="${dDir}">
+      <h2 style="text-align:center;font-size:13pt;${arabicMode?'':'text-transform:uppercase;letter-spacing:.1em;'}margin-bottom:12mm">${pLbl.dedicace}</h2>
+      <div style="text-align:center;font-style:italic;font-size:12pt;line-height:2">${wrapText(dedicaceText)}</div>
+    </div>`, pageMap.dedicace));
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 3. ABSTRACT / RÉSUMÉ
+  // ═══════════════════════════════════════════════════════════
+  let kws = []; try { kws = JSON.parse(d['keywords_list'] || '[]'); } catch(e) {}
+  const absDir = arabicMode ? `direction:rtl;text-align:right;font-family:'Amiri',serif;` : '';
+  const absH2  = arabicMode
+    ? `text-align:center;font-size:13pt;margin-bottom:8mm;font-family:'Amiri',serif;letter-spacing:0`
+    : `text-align:center;font-size:13pt;text-transform:uppercase;letter-spacing:.12em;margin-bottom:8mm`;
+  const absLbl  = `font-size:10pt;font-weight:bold;margin-top:4mm;text-transform:uppercase;letter-spacing:0.06em;`;
+  const absTxt  = `font-size:11pt;text-align:justify;margin-bottom:3mm;`;
+
+  const absContext    = get('abs_context');      // FIX: removed wrong || get('fr_remerciements')
+  const absObjective  = get('abs_objective');
+  const absMethodo    = get('abs_methodology');
+  const absResults    = get('abs_results');
+  const absConclusion = get('abs_conclusion');
+
+  pages.push(pgWrap(`<div style="${absDir}">
+    <h2 style="${absH2}">${pLbl.abstract}</h2>
+    ${absContext    ? `<div style="${absLbl}">${pLbl.context}</div><div style="${absTxt}">${wrapText(absContext)}</div>` : ''}
+    ${absObjective  ? `<div style="${absLbl}">${pLbl.objective}</div><div style="${absTxt}">${wrapText(absObjective)}</div>` : ''}
+    ${absMethodo    ? `<div style="${absLbl}">${pLbl.methodology}</div><div style="${absTxt}">${wrapText(absMethodo)}</div>` : ''}
+    ${absResults    ? `<div style="${absLbl}">${pLbl.results}</div><div style="${absTxt}">${wrapText(absResults)}</div>` : ''}
+    ${absConclusion ? `<div style="${absLbl}">${pLbl.conclusion}</div><div style="${absTxt}">${wrapText(absConclusion)}</div>` : ''}
+    ${kws.length    ? `<div style="${absLbl};margin-top:6mm">${pLbl.keywords}</div><div class="kw-list">${kws.map(k=>`<span class="kw-pill">${escHtml(k)}</span>`).join('')}</div>` : ''}
+  </div>`, pageMap.abstract));
+
+  // ═══════════════════════════════════════════════════════════
+  // 4. TABLE OF CONTENTS
+  //    Front matter  → roman numerals
+  //    Body chapters → numbered from 1 (front matter excluded)
+  //    Refs / Appendices → unnumbered, at the end
+  // ═══════════════════════════════════════════════════════════
+  const tocDir = arabicMode ? 'direction:rtl;' : '';
+  let tocRows  = '';
+
+  // Front matter entries
+  const fmEntries = [
+    [pLbl.abstract,         pageMap.abstract],
+    [pLbl.abbreviations,    pageMap.abbreviations],
+    [pLbl.figures,          pageMap.figures],
+    [pLbl.tables,           pageMap.tables],
+    [pLbl.acknowledgements, pageMap.ack],
+  ];
+  if (hasDedicace) fmEntries.unshift([pLbl.dedicace, pageMap.dedicace]);
+  fmEntries.forEach(([lbl, pg]) => {
+    tocRows += tocRow(`<em>${lbl}</em>`, pg, false, false);
+  });
+  tocRows += `<div style="margin:4mm 0;border-top:1px solid #ccc"></div>`;
+
+  // Body chapter entries — FIX: skip front / refs / appendices
+  let tocChNum = 0;
+  THESIS_STRUCTURE.forEach(ch => {
+    if (SKIP_BODY_CH.has(ch.id)) return;
+    tocChNum++;
+    const chPg  = pageMap['ch_' + ch.id] || bodyP;
+    const chLbl = (data['__ch_label_' + ch.id]) || ch.label;
+    tocRows += tocRow(`${tocChNum}. ${chLbl}`, chPg, true, false);
+    ch.sections.forEach((sec, si) => {
+      if (hiddenSections && hiddenSections[sec.id]) return;
+      const secLbl = (data['__sec_label_' + sec.id]) || sec.label;
+      tocRows += tocRow(`${tocChNum}.${si+1} ${secLbl}`, chPg + si, false, true);
+    });
+  });
+
+  // Back matter in TOC
+  tocRows += tocRow(pLbl.references, pageMap.refs, true, false);
+  const appChInStruct = THESIS_STRUCTURE.find(c => c.id === 'appendices' || c.id === 'annexes');
+  if (appChInStruct) tocRows += tocRow(pLbl.appendices, pageMap.app, true, false);
+
+  const tocH2Style = arabicMode
+    ? `text-align:center;font-size:13pt;margin-bottom:8mm;font-family:'Amiri',serif;letter-spacing:0`
+    : `text-align:center;font-size:13pt;letter-spacing:.05em;margin-bottom:8mm`;
+
+  pages.push(pgWrap(
+    `<div style="${tocDir}"><h2 style="${tocH2Style}">${pLbl.toc}</h2>${tocRows}</div>`,
+    pageMap.toc
+  ));
+
+  // ═══════════════════════════════════════════════════════════
+  // 5. ABBREVIATIONS PAGE
+  // ═══════════════════════════════════════════════════════════
+  const fmDir  = arabicMode ? `direction:rtl;text-align:right;font-family:'Amiri',serif;` : '';
+  const fmH2   = arabicMode
+    ? `text-align:center;font-size:13pt;margin-bottom:8mm;font-family:'Amiri',serif;letter-spacing:0`
+    : `text-align:center;font-size:13pt;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8mm`;
+
+  // Try manager data first, then free-text field fr_abbreviations / abbrev_list
+  const abbrevData     = (typeof getAbbrevs === 'function') ? getAbbrevs() : [];
+  const abbrevFreeText = get('fr_abbreviations') || get('abbrev_list');
+
+  let abbrevBody = `<div style="${fmDir}"><h2 style="${fmH2}">${pLbl.abbreviations}</h2>`;
+  if (abbrevData.length) {
+    abbrevBody += `<table style="width:100%;border-collapse:collapse;font-size:11pt;${fmDir}">`;
+    [...abbrevData].sort((a,b)=>(a.abbr||'').localeCompare(b.abbr||'')).forEach(ab => {
+      abbrevBody += `<tr style="border-bottom:1px dotted #ccc">
+        <td style="padding:2mm 0;font-weight:bold;width:30mm">${escHtml(ab.abbr||'')}</td>
+        <td style="padding:2mm 4mm">${escHtml(ab.full||'')}</td>
+      </tr>`;
+    });
+    abbrevBody += `</table>`;
+  } else if (abbrevFreeText) {
+    abbrevFreeText.split('\n').filter(Boolean).forEach(line => {
+      const parts = line.split(/\s*:\s*/);
+      if (parts.length >= 2) {
+        abbrevBody += `<div style="display:flex;gap:8mm;padding:2mm 0;border-bottom:1px dotted #ddd;font-size:11pt">
+          <span style="font-weight:bold;min-width:40mm">${escHtml(parts[0].trim())}</span>
+          <span>${escHtml(parts.slice(1).join(': ').trim())}</span>
+        </div>`;
+      } else {
+        abbrevBody += `<div style="font-size:11pt;padding:2mm 0">${escHtml(line)}</div>`;
+      }
+    });
+  } else {
+    abbrevBody += `<p style="color:#aaa;font-style:italic">${arabicMode?'لا توجد مختصرات.':(frenchMode?'Aucune abréviation enregistrée.':'No abbreviations registered.')}</p>`;
+  }
+  abbrevBody += `</div>`;
+  pages.push(pgWrap(abbrevBody, pageMap.abbreviations));
+
+  // ═══════════════════════════════════════════════════════════
+  // 6. LIST OF FIGURES
+  // ═══════════════════════════════════════════════════════════
+  const figs = (typeof getFigures === 'function') ? getFigures() : [];
+  pages.push(pgWrap(`<div style="${fmDir}">
+    <h2 style="${fmH2}">${pLbl.figures}</h2>
+    ${figs.length
+      ? `<table style="width:100%;border-collapse:collapse;font-size:11pt;${fmDir}">${figs.map(f=>`<tr style="border-bottom:1px dotted #ccc">
+          <td style="padding:2mm 0">${arabicMode?'شكل':'Fig.'}&nbsp;${f.num||'?'}</td>
+          <td style="padding:2mm 4mm;flex:1">${escHtml(f.title||'(untitled)')}</td>
+          <td style="white-space:nowrap;${arabicMode?'text-align:left':'text-align:right'}">${f.page?(arabicMode?'ص.':'p.')+f.page:''}</td>
+        </tr>`).join('')}</table>`
+      : `<p style="color:#aaa;font-style:italic">${arabicMode?'لا توجد أشكال.':(frenchMode?'Aucune figure enregistrée.':'No figures registered.')}</p>`}
+  </div>`, pageMap.figures));
+
+  // ═══════════════════════════════════════════════════════════
+  // 7. LIST OF TABLES
+  // ═══════════════════════════════════════════════════════════
+  const tbls = (typeof getTables === 'function') ? getTables() : [];
+  pages.push(pgWrap(`<div style="${fmDir}">
+    <h2 style="${fmH2}">${pLbl.tables}</h2>
+    ${tbls.length
+      ? `<table style="width:100%;border-collapse:collapse;font-size:11pt;${fmDir}">${tbls.map(t=>`<tr style="border-bottom:1px dotted #ccc">
+          <td style="padding:2mm 0">${arabicMode?'جدول':'Tab.'}&nbsp;${t.num||'?'}</td>
+          <td style="padding:2mm 4mm;flex:1">${escHtml(t.title||'(untitled)')}</td>
+          <td style="white-space:nowrap;${arabicMode?'text-align:left':'text-align:right'}">${t.page?(arabicMode?'ص.':'p.')+t.page:''}</td>
+        </tr>`).join('')}</table>`
+      : `<p style="color:#aaa;font-style:italic">${arabicMode?'لا توجد جداول.':(frenchMode?'Aucun tableau enregistré.':'No tables registered.')}</p>`}
+  </div>`, pageMap.tables));
+
+  // ═══════════════════════════════════════════════════════════
+  // 8. ACKNOWLEDGEMENTS / REMERCIEMENTS
+  // ═══════════════════════════════════════════════════════════
+  const ackText = get('ack_text') || get('fr_remerciements');
+  if (ackText) {
+    pages.push(pgWrap(`<div style="${fmDir}">
+      <h2 style="${fmH2}">${pLbl.acknowledgements}</h2>
+      <div style="font-size:11pt;text-align:justify;line-height:1.8">${wrapText(ackText)}</div>
+    </div>`, pageMap.ack));
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 9. BODY CHAPTERS
+  //    FIX: bodyChNum starts at 1, front/refs/appendices skipped
+  // ═══════════════════════════════════════════════════════════
+  const chapterDir = arabicMode ? 'direction:rtl;text-align:right;font-family:\'Amiri\',serif;' : '';
+  const A4_PX = 900;
+
+  function measureHeight(html) {
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute;visibility:hidden;width:163mm;font-family:\'Times New Roman\',serif;font-size:12pt;line-height:1.8;padding:0;margin:0;top:-9999px;left:-9999px;';
+    probe.innerHTML = html;
+    document.body.appendChild(probe);
+    const h = probe.offsetHeight;
+    document.body.removeChild(probe);
+    return h;
+  }
+
+  function paginateBlocks(headerHtml, blocks, pgNumStart) {
+    const pagesOut = [];
+    let cur = [headerHtml];
+    let curH = measureHeight(headerHtml);
+    let pg = pgNumStart;
+    blocks.forEach(block => {
+      const bH = measureHeight(block);
+      if (curH + bH > A4_PX && cur.length > 1) {
+        pagesOut.push(pgWrap(cur.join(''), pg));
+        pg++;
+        cur  = [block];
+        curH = bH;
+      } else {
+        cur.push(block);
+        curH += bH;
+      }
+    });
+    if (cur.length) { pagesOut.push(pgWrap(cur.join(''), pg)); pg++; }
+    return { pages: pagesOut, nextPg: pg };
+  }
+
+  let bodyPg   = 1;
+  let bodyChNum = 0; // FIX: separate counter, skips front/refs/appendices
+
+  THESIS_STRUCTURE.forEach(ch => {
+    if (SKIP_BODY_CH.has(ch.id)) return;          // ← THE CRITICAL FIX
+    if (hiddenChapters && hiddenChapters[ch.id]) return;
+
+    bodyChNum++;
+    const chNum        = bodyChNum;               // now starts at 1 for the real first chapter
+    const chDisplayLabel = (data['__ch_label_' + ch.id]) || ch.label;
+
+    const chHeaderHtml = `<div class="ch-page-header" style="${chapterDir}border-bottom:2px solid #000;padding-bottom:4mm;margin-bottom:8mm">
+      <div class="ch-chapter-label" style="font-size:10pt;letter-spacing:0.05em;color:#555;margin-bottom:2mm">${pLbl.chapterWord} ${chNum}</div>
+      <div class="ch-title" style="font-size:18pt;font-weight:bold;line-height:1.2;font-family:${arabicMode?"'Amiri',serif":"'Times New Roman',serif"}">${escHtml(chDisplayLabel)}</div>
+    </div>`;
+
+    const sectionBlocks = [];
+    ch.sections.forEach((sec, si) => {
+      if (hiddenSections && hiddenSections[sec.id]) return;
+      const secLbl = (data['__sec_label_' + sec.id]) || sec.label;
+      const secText = buildSectionText(sec, d, get);
+      sectionBlocks.push(`<div style="${chapterDir}margin-bottom:7mm">
+        <div style="font-size:12pt;font-weight:bold;margin-bottom:2mm;padding-${arabicMode?'right':'left'}:3mm;border-${arabicMode?'right':'left'}:3px solid #b5451b">
+          ${chNum}.${si+1} ${escHtml(secLbl)}
+        </div>
+        <div style="font-size:11pt;text-align:justify;color:#111;line-height:1.7">${secText || `<span style="color:#aaa;font-style:italic">${pLbl.notWritten}</span>`}</div>
+      </div>`);
+    });
+
+    const result = paginateBlocks(chHeaderHtml, sectionBlocks, bodyPg);
+    result.pages.forEach(p => pages.push(p));
+    bodyPg = result.nextPg;
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // 10. REFERENCES
+  // ═══════════════════════════════════════════════════════════
+  const refs    = (typeof getRefs === 'function') ? getRefs() : [];
+  const refDir  = arabicMode ? `direction:rtl;text-align:right;font-family:'Amiri',serif;` : '';
+  let refBody   = `<div style="${refDir}border-bottom:2px solid #000;padding-bottom:4mm;margin-bottom:8mm">
+    <div style="font-size:10pt;letter-spacing:0.05em;color:#555;margin-bottom:2mm">${arabicMode?'توثيق المصادر':(frenchMode?'Sources':'Bibliography')}</div>
+    <div style="font-size:18pt;font-weight:bold;font-family:${arabicMode?"'Amiri',serif":"'Times New Roman',serif"}">${pLbl.references}</div>
+  </div>`;
+
+  const sortedRefs = [...refs].sort((a,b)=>(a.authors||'').localeCompare(b.authors||''));
+  if (sortedRefs.length) {
+    refBody += sortedRefs.map(r =>
+      `<div style="font-size:11pt;text-align:justify;padding-${arabicMode?'right':'left'}:8mm;text-indent:-8mm;margin-bottom:4mm;line-height:1.5;${refDir}">${formatAPA(r)}</div>`
+    ).join('');
+  }
+  const manualRefs = get('ref_list');
+  if (manualRefs) {
+    if (sortedRefs.length) refBody += `<hr style="border:none;border-top:1px dotted #ccc;margin:4mm 0">`;
+    refBody += manualRefs.split('\n').filter(Boolean).map(r =>
+      `<div style="font-size:11pt;text-align:justify;padding-${arabicMode?'right':'left'}:8mm;text-indent:-8mm;margin-bottom:4mm;line-height:1.5;${refDir}">${escHtml(r)}</div>`
+    ).join('');
+  }
+  if (!sortedRefs.length && !manualRefs) {
+    refBody += `<p style="color:#aaa;font-style:italic">${arabicMode?'لم تُضَف مراجع بعد.':(frenchMode?'Aucune référence ajoutée.':'No references added yet.')}</p>`;
+  }
+  pages.push(pgWrap(refBody, bodyPg));
+  bodyPg++;
+
+  // ═══════════════════════════════════════════════════════════
+  // 11. APPENDICES  (FIX: previously never rendered)
+  // ═══════════════════════════════════════════════════════════
+  const appCh = THESIS_STRUCTURE.find(c => c.id === 'appendices' || c.id === 'annexes');
+  if (appCh) {
+    const appDir = arabicMode ? `direction:rtl;text-align:right;font-family:'Amiri',serif;` : '';
+    let appBody  = `<div style="${appDir}border-bottom:2px solid #000;padding-bottom:4mm;margin-bottom:8mm">
+      <div style="font-size:10pt;letter-spacing:0.05em;color:#555;margin-bottom:2mm">${arabicMode?'مستندات داعمة':(frenchMode?'Documents complémentaires':'Supporting Material')}</div>
+      <div style="font-size:18pt;font-weight:bold;font-family:${arabicMode?"'Amiri',serif":"'Times New Roman',serif"}">${pLbl.appendices}</div>
+    </div>`;
+
+    appCh.sections.forEach((sec, si) => {
+      if (hiddenSections && hiddenSections[sec.id]) return;
+      const secLbl = (data['__sec_label_' + sec.id]) || sec.label;
+      const secText = buildSectionText(sec, d, get);
+      if (!secText) return;
+      appBody += `<div style="${appDir}margin-bottom:10mm">
+        <div style="font-size:13pt;font-weight:bold;margin-bottom:3mm;border-${arabicMode?'right':'left'}:3px solid #2a5f8f;padding-${arabicMode?'right':'left'}:4mm">${escHtml(secLbl)}</div>
+        <div style="font-size:11pt;line-height:1.7;text-align:justify;${appDir}">${secText}</div>
+      </div>`;
+    });
+
+    pages.push(pgWrap(appBody, bodyPg));
+    bodyPg++;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 12. RÉSUMÉ — 4ème de couverture (French only)
+  // ═══════════════════════════════════════════════════════════
+  const resumeAbstractFr = get('abs_context');
+  const resumeAbstractEn = get('fr_abstract_en');
+  if (frenchMode && (resumeAbstractFr || resumeAbstractEn)) {
+    let kw4 = []; try { kw4 = JSON.parse(d['keywords_list'] || '[]'); } catch(e) {}
+    pages.push(pgWrap(`<div>
+      <h2 style="text-align:center;font-size:13pt;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8mm">Résumé</h2>
+      ${resumeAbstractFr ? `<div style="font-size:11pt;text-align:justify;margin-bottom:6mm">${wrapText(resumeAbstractFr)}</div>` : ''}
+      ${resumeAbstractEn ? `<h2 style="text-align:center;font-size:13pt;text-transform:uppercase;letter-spacing:.1em;margin:8mm 0">Abstract</h2><div style="font-size:11pt;text-align:justify;margin-bottom:6mm">${wrapText(resumeAbstractEn)}</div>` : ''}
+      ${kw4.length ? `<div style="font-weight:bold;margin-bottom:4mm">Mots-clés :</div><div class="kw-list">${kw4.map(k=>`<span class="kw-pill">${escHtml(k)}</span>`).join('')}</div>` : ''}
+    </div>`, bodyPg));
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // RENDER
+  // ═══════════════════════════════════════════════════════════
+  wrap.innerHTML = pages.join('');
+  changePrintZoom(0);
+  addRunningHeaders();
+  if (arabicMode) applyArabicPrintStyles();
+};
+
+console.log('[Thesis Patch] renderPrintPages overridden — all print bugs fixed ✓');
+})(); 
+  
+  </script>
 
 <!-- LANGUAGE PICKER SCREEN -->
 <!-- TEMPLATE PICKER -->
